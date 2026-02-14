@@ -45,6 +45,7 @@ import ColorType;
 import NRDHelpers;
 __exported import PathState;
 __exported import Params;
+__exported import RayLogEntry;
 import Rendering.RTXDI.RTXDI;
 
 /** Interface for querying visibility in the scene.
@@ -84,6 +85,10 @@ struct PathTracer
     NRDBuffers outputNRD;                           ///< Output NRD data.
 
     RWTexture2D<float4> outputColor;                ///< Output color buffer if kSamplesPerPixel == 1.
+
+    // Ray logging
+    RWStructuredBuffer<RayLogEntry> rayLogBuffer;   ///< Buffer to store logged ray data.
+    RWByteAddressBuffer rayLogCounter;              ///< Atomic counter for the number of logged rays.
 
     /*******************************************************************
                                 Static members
@@ -307,6 +312,39 @@ struct PathTracer
     {
         printSetPixel(path.getPixel());
         logSetPixel(path.getPixel());
+    }
+
+    /** Stochastically log a ray for debugging/analysis.
+        Approximately 0.1% of rays (1/1024) are logged into a structured buffer.
+        \param[in] path Path state containing ray origin and direction.
+        \param[in] hitPoint World-space hit point (zero if miss).
+        \param[in] isHit True if the ray hit geometry.
+    */
+    void logRayData(const PathState path, float3 hitPoint, bool isHit)
+    {
+        // Early out if logging is disabled or buffer size is zero.
+        if (params.rayLogEnable == 0 || params.rayLogBufferSize == 0) return;
+
+        // Use a hash of the path ID, frame count, and vertex index to stochastically select ~0.1% of rays (1/1024).
+        // Including vertexIndex ensures each bounce is independently selected.
+        uint hash = path.id ^ (params.frameCount * 0x9e3779b9u) ^ (path.getVertexIndex() * 0x85ebca6bu);
+        hash *= 2654435761u; // Knuth multiplicative hash
+        if ((hash & 0x3FFu) != 0u) return; // Accept only when lower 10 bits are zero (~1/1024).
+
+        // Atomically allocate a slot in the log buffer.
+        uint idx;
+        rayLogCounter.InterlockedAdd(0, 1, idx);
+        if (idx >= params.rayLogBufferSize) return; // Buffer is full, discard.
+
+        RayLogEntry entry;
+        entry.origin = path.origin;
+        entry._pad0 = 0.f;
+        entry.direction = path.dir;
+        entry._pad1 = 0.f;
+        entry.hitPoint = hitPoint;
+        entry.isHit = isHit ? 1u : 0u;
+
+        rayLogBuffer[idx] = entry;
     }
 
     /** Compute a set of coherence hints for a given path state.
@@ -835,6 +873,9 @@ struct PathTracer
         // Load shading data. This is a long latency operation.
         ShadingData sd = loadShadingData(path.hit, path.origin, path.dir);
 
+        // Log the ray (hit case).
+        logRayData(path, sd.posW, true);
+
         const bool isHairMaterial = kUseHairMaterial && (sd.mtl.getMaterialType() == MaterialType::Hair);
         // TODO: Decouple geometry from the material.
         const bool isCurvePolyTubeHit = isTriangleHit && isHairMaterial;
@@ -1070,6 +1111,9 @@ struct PathTracer
     */
     void handleMiss(inout PathState path)
     {
+        // Log the ray (miss case).
+        logRayData(path, float3(0.f), false);
+
         // Upon miss:
         // - Compute MIS weight if previous path vertex sampled a light
         // - Evaluate environment map

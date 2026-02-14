@@ -416,6 +416,9 @@ void PathTracer::setFrameDim(const uint2 frameDim)
 
 void PathTracer::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
+    // Flush any accumulated ray log data before changing scenes.
+    flushRayLogToCSV();
+
     mUpdateFlagsConnection = {};
     mUpdateFlags = IScene::UpdateFlags::None;
 
@@ -426,6 +429,14 @@ void PathTracer::setScene(RenderContext* pRenderContext, const ref<Scene>& pScen
 
     // Need to recreate the RTXDI module when the scene changes.
     mpRTXDI = nullptr;
+
+    // Reset ray logging GPU resources when scene changes.
+    mpRayLogBuffer = nullptr;
+    mpRayLogCounterBuffer = nullptr;
+    mpRayLogStagingBuffer = nullptr;
+    mpRayLogCounterStagingBuffer = nullptr;
+    mpRayLogFence = nullptr;
+    mRayLogReadbackPending = false;
 
     resetPrograms();
     resetLighting();
@@ -453,6 +464,9 @@ void PathTracer::execute(RenderContext* pRenderContext, const RenderData& render
 
     // Prepare resources.
     prepareResources(pRenderContext, renderData);
+
+    // Prepare ray logging resources (creates buffers, clears counter).
+    prepareRayLogResources(pRenderContext);
 
     // Prepare the path tracer parameter block.
     // This should be called after all resources have been created.
@@ -482,6 +496,9 @@ void PathTracer::execute(RenderContext* pRenderContext, const RenderData& render
 
     // Resolve pass.
     resolvePass(pRenderContext, renderData);
+
+    // Read back ray log data from GPU (asynchronous).
+    readbackRayLogData(pRenderContext);
 
     endFrame(pRenderContext, renderData);
 }
@@ -671,6 +688,36 @@ bool PathTracer::renderDebugUI(Gui::Widgets& widget)
         }
 
         mpPixelDebug->renderUI(group);
+    }
+
+    if (auto group = widget.group("Ray Logging"))
+    {
+        group.checkbox("Enable ray logging", mEnableRayLogging);
+        group.tooltip("Log ~0.1% of traced rays (origin, direction, hit point) to a CSV file.\n"
+            "Rays are accumulated in CPU memory and flushed to disk when the memory threshold is exceeded.");
+
+        if (mEnableRayLogging)
+        {
+            // Show accumulated ray count and memory usage.
+            size_t accumulatedCount = mAccumulatedRayLog.size();
+            size_t memoryUsageMB = (accumulatedCount * sizeof(RayLogEntry)) / (1024 * 1024);
+            size_t thresholdMB = mRayLogMemoryThreshold / (1024 * 1024);
+            group.text(fmt::format("Accumulated rays: {} ({} / {} MB)", accumulatedCount, memoryUsageMB, thresholdMB));
+            group.text(fmt::format("CSV files written: {}", mRayLogFileCounter));
+
+            // Allow user to change memory threshold.
+            uint32_t thresholdMBVar = static_cast<uint32_t>(thresholdMB);
+            if (group.var("Memory threshold (MB)", thresholdMBVar, 1u, 4096u))
+            {
+                mRayLogMemoryThreshold = static_cast<size_t>(thresholdMBVar) * 1024 * 1024;
+            }
+
+            // Manual flush button.
+            if (group.button("Flush to CSV now"))
+            {
+                flushRayLogToCSV();
+            }
+        }
     }
 
     return dirty;
@@ -1092,11 +1139,21 @@ void PathTracer::bindShaderData(const ShaderVar& var, const RenderData& renderDa
     // Bind static resources that don't change per frame.
     if (mVarsChanged)
     {
-        if (useLightSampling && mpEnvMapSampler) mpEnvMapSampler->bindShaderData(var["envMapSampler"]);
+        if (useLightSampling && mpEnvMapSampler)
+            mpEnvMapSampler->bindShaderData(var["envMapSampler"]);
 
         var["sampleOffset"] = mpSampleOffset; // Can be nullptr
         var["sampleColor"] = mpSampleColor;
         var["sampleGuideData"] = mpSampleGuideData;
+
+        // Bind ray log buffers.
+        if (useLightSampling)
+        {
+            if (mpRayLogBuffer)
+                var["rayLogBuffer"] = mpRayLogBuffer;
+            if (mpRayLogCounterBuffer)
+                var["rayLogCounter"] = mpRayLogCounterBuffer;
+        }
     }
 
     // Bind runtime data.
@@ -1390,6 +1447,175 @@ void PathTracer::resolvePass(RenderContext* pRenderContext, const RenderData& re
 
     // Launch one thread per pixel.
     mpResolvePass->execute(pRenderContext, { mParams.frameDim, 1u });
+}
+
+void PathTracer::prepareRayLogResources(RenderContext* pRenderContext)
+{
+    auto var = mpReflectTypes->getRootVar();
+
+    // Always create the GPU ray log buffer so it can be bound to the shader (even when disabled).
+    // We use a minimal 1-element buffer when logging is disabled to avoid binding null resources.
+    if (!mpRayLogBuffer)
+    {
+        uint32_t bufferSize = mEnableRayLogging ? kRayLogBufferSize : 1;
+        mpRayLogBuffer = mpDevice->createStructuredBuffer(
+            var["rayLogBuffer"], bufferSize,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal, nullptr, false
+        );
+        mVarsChanged = true;
+    }
+
+    // Always create the counter buffer.
+    if (!mpRayLogCounterBuffer)
+    {
+        mpRayLogCounterBuffer = mpDevice->createBuffer(
+            sizeof(uint32_t),
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal, nullptr
+        );
+        mVarsChanged = true;
+    }
+
+    if (!mEnableRayLogging)
+    {
+        // If logging is disabled, ensure params reflect that.
+        mParams.rayLogEnable = 0;
+        mParams.rayLogBufferSize = 0;
+        return;
+    }
+
+    // Reallocate the buffer at full size if it was created as minimal.
+    if (mpRayLogBuffer->getElementCount() < kRayLogBufferSize)
+    {
+        mpRayLogBuffer = mpDevice->createStructuredBuffer(
+            var["rayLogBuffer"], kRayLogBufferSize,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal, nullptr, false
+        );
+        mVarsChanged = true;
+    }
+
+    // Create staging buffers for readback.
+    if (!mpRayLogStagingBuffer)
+    {
+        mpRayLogStagingBuffer = mpDevice->createStructuredBuffer(
+            var["rayLogBuffer"], kRayLogBufferSize,
+            ResourceBindFlags::None,
+            MemoryType::ReadBack, nullptr, false
+        );
+    }
+
+    if (!mpRayLogCounterStagingBuffer)
+    {
+        mpRayLogCounterStagingBuffer = mpDevice->createBuffer(
+            sizeof(uint32_t),
+            ResourceBindFlags::None,
+            MemoryType::ReadBack, nullptr
+        );
+    }
+
+    // Create fence for synchronization.
+    if (!mpRayLogFence)
+    {
+        mpRayLogFence = mpDevice->createFence();
+    }
+
+    // Clear the atomic counter to zero at the start of each frame.
+    uint32_t zero = 0;
+    pRenderContext->updateBuffer(mpRayLogCounterBuffer.get(), &zero, 0, sizeof(uint32_t));
+
+    // Set params so the shader knows logging is active.
+    mParams.rayLogEnable = 1;
+    mParams.rayLogBufferSize = kRayLogBufferSize;
+}
+
+void PathTracer::readbackRayLogData(RenderContext* pRenderContext)
+{
+    // Process any pending readback from the previous frame (even if logging was just disabled).
+    if (mRayLogReadbackPending)
+    {
+        mpRayLogFence->wait();
+        mRayLogReadbackPending = false;
+
+        // Read the counter value to determine how many entries were written.
+        const uint32_t* pCount = static_cast<const uint32_t*>(mpRayLogCounterStagingBuffer->map());
+        uint32_t entryCount = std::min(*pCount, kRayLogBufferSize);
+        mpRayLogCounterStagingBuffer->unmap();
+
+        if (entryCount > 0)
+        {
+            // Read the ray log entries.
+            const RayLogEntry* pEntries = static_cast<const RayLogEntry*>(mpRayLogStagingBuffer->map());
+            mAccumulatedRayLog.insert(mAccumulatedRayLog.end(), pEntries, pEntries + entryCount);
+            mpRayLogStagingBuffer->unmap();
+
+            // Check if we should flush to CSV.
+            size_t currentMemoryUsage = mAccumulatedRayLog.size() * sizeof(RayLogEntry);
+            if (currentMemoryUsage >= mRayLogMemoryThreshold)
+            {
+                flushRayLogToCSV();
+            }
+        }
+
+        // If logging was just disabled, flush any remaining data.
+        if (!mEnableRayLogging && !mAccumulatedRayLog.empty())
+        {
+            flushRayLogToCSV();
+        }
+    }
+
+    // If logging is disabled, don't initiate new readbacks.
+    if (!mEnableRayLogging || !mpRayLogStagingBuffer || !mpRayLogCounterStagingBuffer)
+        return;
+
+    // Initiate readback for the current frame.
+    pRenderContext->copyResource(mpRayLogStagingBuffer.get(), mpRayLogBuffer.get());
+    pRenderContext->copyResource(mpRayLogCounterStagingBuffer.get(), mpRayLogCounterBuffer.get());
+    pRenderContext->submit(false);
+    pRenderContext->signal(mpRayLogFence.get());
+    mRayLogReadbackPending = true;
+}
+
+void PathTracer::flushRayLogToCSV()
+{
+    if (mAccumulatedRayLog.empty()) return;
+
+    // Determine output path.
+    std::filesystem::path outputDir = mRayLogOutputPath;
+    if (outputDir.empty())
+    {
+        outputDir = std::filesystem::current_path() / "ray_logs";
+    }
+    std::filesystem::create_directories(outputDir);
+
+    std::filesystem::path filePath = outputDir / fmt::format("ray_log_{:04d}.csv", mRayLogFileCounter++);
+
+    std::ofstream ofs(filePath);
+    if (!ofs.good())
+    {
+        logWarning("PathTracer: Failed to open ray log file '{}'.", filePath.string());
+        return;
+    }
+
+    // Write CSV header.
+    ofs << "origin_x,origin_y,origin_z,direction_x,direction_y,direction_z,hit_point_x,hit_point_y,hit_point_z,is_hit\n";
+
+    // Write entries.
+    for (const auto& entry : mAccumulatedRayLog)
+    {
+        ofs << fmt::format("{},{},{},{},{},{},{},{},{},{}\n",
+            entry.origin.x, entry.origin.y, entry.origin.z,
+            entry.direction.x, entry.direction.y, entry.direction.z,
+            entry.hitPoint.x, entry.hitPoint.y, entry.hitPoint.z,
+            entry.isHit);
+    }
+
+    logInfo("PathTracer: Flushed {} ray log entries to '{}'.", mAccumulatedRayLog.size(), filePath.string());
+
+    // Clear accumulated data.
+    mAccumulatedRayLog.clear();
+    mAccumulatedRayLog.shrink_to_fit();
 }
 
 DefineList PathTracer::StaticParams::getDefines(const PathTracer& owner) const

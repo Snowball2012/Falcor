@@ -90,7 +90,8 @@ struct PathTracerParams
 
     uint    frameCount = 0;             ///< Frames rendered. This is used as random seed.
     uint    seed = 0;                   ///< Random seed. This will get updated from the host depending on settings.
-    uint2   _pad0;
+    uint    rayLogBufferSize = 0;       ///< Maximum number of ray log entries (0 = logging disabled).
+    uint    rayLogEnable = 0;           ///< Enable ray logging (non-zero = enabled).
 
 #ifndef HOST_CODE
     /** Computes the offset into the tiled sample buffer for a given tile.

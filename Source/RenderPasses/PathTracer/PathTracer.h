@@ -38,9 +38,25 @@
 #include "Rendering/Utils/PixelStats.h"
 #include "Rendering/RTXDI/RTXDI.h"
 
+#include <fstream>
+#include <filesystem>
+
 #include "Params.slang"
 
 using namespace Falcor;
+
+/** CPU-side struct matching the GPU RayLogEntry layout (48 bytes).
+*/
+struct RayLogEntry
+{
+    Falcor::float3 origin;
+    float _pad0;
+    Falcor::float3 direction;
+    float _pad1;
+    Falcor::float3 hitPoint;
+    uint32_t isHit;
+};
+static_assert(sizeof(RayLogEntry) == 48, "RayLogEntry must be 48 bytes to match GPU struct layout.");
 
 /** Fast path tracer.
 */
@@ -109,6 +125,11 @@ private:
     void generatePaths(RenderContext* pRenderContext, const RenderData& renderData);
     void tracePass(RenderContext* pRenderContext, const RenderData& renderData, TracePass& tracePass);
     void resolvePass(RenderContext* pRenderContext, const RenderData& renderData);
+
+    // Ray logging
+    void prepareRayLogResources(RenderContext* pRenderContext);
+    void readbackRayLogData(RenderContext* pRenderContext);
+    void flushRayLogToCSV();
 
     /** Static configuration. Changing any of these options require shader recompilation.
     */
@@ -204,4 +225,20 @@ private:
     ref<Buffer>                     mpSampleNRDPrimaryHitNeeOnDelta;///< Compact per-sample NEE on delta primary vertices data.
     ref<Buffer>                     mpSampleNRDEmission;        ///< Compact per-sample NRD emission data.
     ref<Buffer>                     mpSampleNRDReflectance;     ///< Compact per-sample NRD reflectance data.
+
+    // Ray logging resources
+    static const uint32_t           kRayLogBufferSize = 262144; ///< Max ray log entries per frame (256K).
+    bool                            mEnableRayLogging = false;  ///< Enable/disable ray logging.
+    size_t                          mRayLogMemoryThreshold = 256 * 1024 * 1024; ///< Memory threshold in bytes before flushing to CSV (default 256MB).
+    std::filesystem::path           mRayLogOutputPath;          ///< Output directory for CSV files.
+    uint32_t                        mRayLogFileCounter = 0;     ///< Counter for CSV file naming.
+
+    ref<Buffer>                     mpRayLogBuffer;             ///< GPU structured buffer for logged rays.
+    ref<Buffer>                     mpRayLogCounterBuffer;      ///< GPU raw buffer used as atomic counter.
+    ref<Buffer>                     mpRayLogStagingBuffer;      ///< Staging buffer for ray log readback.
+    ref<Buffer>                     mpRayLogCounterStagingBuffer; ///< Staging buffer for counter readback.
+    ref<Fence>                      mpRayLogFence;              ///< Fence for readback synchronization.
+    bool                            mRayLogReadbackPending = false; ///< Whether a readback is pending from the previous frame.
+
+    std::vector<RayLogEntry>        mAccumulatedRayLog;         ///< CPU-side accumulated ray log data.
 };
