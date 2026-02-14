@@ -1,6 +1,8 @@
 #include "GenerateProbes.h"
+#include "Utils/Image/Bitmap.h"
 
 #include <cmath>
+#include <fstream>
 
 namespace
 {
@@ -13,8 +15,11 @@ const char kOutput[] = "output";
 const char kProbeDensity[] = "probeDensity";
 const char kProbeRadius[] = "probeRadius";
 const char kEnabled[] = "enabled";
+const char kProbeImageResolution[] = "probeImageResolution";
+const char kSavePath[] = "savePath";
 
 const char kShaderFile[] = "RenderPasses/GenerateProbes/GenerateProbes.cs.slang";
+const char kRayTraceShaderFile[] = "RenderPasses/GenerateProbes/GenerateProbeImages.cs.slang";
 } // namespace
 
 static void regGenerateProbes(pybind11::module& m)
@@ -41,6 +46,10 @@ GenerateProbes::GenerateProbes(ref<Device> pDevice, const Properties& props) : R
             mProbeRadius = value;
         else if (key == kEnabled)
             mEnabled = value;
+        else if (key == kProbeImageResolution)
+            mProbeImageResolution = value;
+        else if (key == kSavePath)
+            mSavePath = (const std::string&)value;
         else
             logWarning("Unknown property '{}' in GenerateProbes properties.", key);
     }
@@ -52,6 +61,8 @@ Properties GenerateProbes::getProperties() const
     props[kProbeDensity] = mProbeDensity;
     props[kProbeRadius] = mProbeRadius;
     props[kEnabled] = mEnabled;
+    props[kProbeImageResolution] = mProbeImageResolution;
+    props[kSavePath] = mSavePath;
     return props;
 }
 
@@ -80,20 +91,36 @@ void GenerateProbes::setScene(RenderContext* pRenderContext, const ref<Scene>& p
 {
     mpScene = pScene;
     mpDrawProbesPass = nullptr;
+    mpRayTracePass = nullptr;
     mpProbeBuffer = nullptr;
+    mpProbeImage = nullptr;
     mProbeCount = 0;
+    mProbePositions.clear();
     mProbesDirty = true;
 
     if (mpScene)
     {
-        // Create the compute pass with scene shader modules and type conformances.
-        ProgramDesc desc;
-        desc.addShaderModules(mpScene->getShaderModules());
-        desc.addShaderLibrary(kShaderFile).csEntry("main");
-        desc.addTypeConformances(mpScene->getTypeConformances());
+        // Create the visualization compute pass.
+        {
+            ProgramDesc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kShaderFile).csEntry("main");
+            desc.addTypeConformances(mpScene->getTypeConformances());
 
-        DefineList defines = mpScene->getSceneDefines();
-        mpDrawProbesPass = ComputePass::create(mpDevice, desc, defines);
+            DefineList defines = mpScene->getSceneDefines();
+            mpDrawProbesPass = ComputePass::create(mpDevice, desc, defines);
+        }
+
+        // Create the ray tracing compute pass (for probe image generation).
+        {
+            ProgramDesc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kRayTraceShaderFile).csEntry("main");
+            desc.addTypeConformances(mpScene->getTypeConformances());
+
+            DefineList defines = mpScene->getSceneDefines();
+            mpRayTracePass = ComputePass::create(mpDevice, desc, defines);
+        }
 
         // Generate initial probe grid.
         generateProbes();
@@ -110,6 +137,7 @@ void GenerateProbes::generateProbes()
     {
         logWarning("GenerateProbes: Scene has invalid bounding box. No probes generated.");
         mProbeCount = 0;
+        mProbePositions.clear();
         mpProbeBuffer = nullptr;
         mProbesDirty = false;
         return;
@@ -153,8 +181,8 @@ void GenerateProbes::generateProbes()
     gridOrigin.z = sceneMin.z + (extent.z - gridExtZ) * 0.5f;
 
     // Generate probe positions on a uniform 3D grid.
-    std::vector<float4> positions;
-    positions.reserve(mProbeCount);
+    mProbePositions.clear();
+    mProbePositions.reserve(mProbeCount);
 
     for (uint32_t iz = 0; iz < nz; iz++)
     {
@@ -166,7 +194,7 @@ void GenerateProbes::generateProbes()
                 pos.x = gridOrigin.x + ix * density;
                 pos.y = gridOrigin.y + iy * density;
                 pos.z = gridOrigin.z + iz * density;
-                positions.push_back(float4(pos, 0.0f));
+                mProbePositions.push_back(float4(pos, 0.0f));
             }
         }
     }
@@ -179,7 +207,7 @@ void GenerateProbes::generateProbes()
             mProbeCount,
             ResourceBindFlags::ShaderResource,
             MemoryType::DeviceLocal,
-            positions.data(),
+            mProbePositions.data(),
             false
         );
     }
@@ -209,11 +237,142 @@ void GenerateProbes::setProbeRadius(float r)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Probe image generation
+// ---------------------------------------------------------------------------
+
+void GenerateProbes::generateProbeImages(RenderContext* pRenderContext)
+{
+    if (!mpScene || !mpRayTracePass)
+    {
+        logWarning("GenerateProbes: Cannot generate probe images — no scene loaded.");
+        return;
+    }
+
+    if (mProbeCount == 0 || mProbePositions.empty())
+    {
+        logWarning("GenerateProbes: No probes to generate images for.");
+        return;
+    }
+
+    uint32_t res = mProbeImageResolution;
+
+    // Create / resize the single-probe image texture (R32Float for computation,
+    // saved to disk as EXR float16).
+    if (!mpProbeImage || mpProbeImage->getWidth() != res || mpProbeImage->getHeight() != res)
+    {
+        mpProbeImage = mpDevice->createTexture2D(
+            res,
+            res,
+            ResourceFormat::R32Float,
+            1,
+            1,
+            nullptr,
+            ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+        );
+    }
+
+    // Ensure the output directory exists.
+    std::filesystem::path savePath(mSavePath);
+    std::filesystem::create_directories(savePath);
+
+    // Open CSV file.
+    std::filesystem::path csvPath = savePath / "probes.csv";
+    std::ofstream csv(csvPath);
+    if (!csv.is_open())
+    {
+        logError("GenerateProbes: Failed to open CSV file '{}'.", csvPath.string());
+        return;
+    }
+    csv << "index,x,y,z,filename\n";
+
+    // Bind scene data for ray tracing (builds/updates TLAS).
+    mpScene->bindShaderDataForRaytracing(pRenderContext, mpRayTracePass->getRootVar()["gScene"]);
+
+    auto var = mpRayTracePass->getRootVar();
+    var["CB"]["gImageResolution"] = res;
+    var["gOutput"] = mpProbeImage;
+
+    // EXR export flags: uncompressed float16.
+    Bitmap::ExportFlags exportFlags = Bitmap::ExportFlags::Uncompressed | Bitmap::ExportFlags::ExrFloat16;
+
+    logInfo("GenerateProbes: Generating {} probe images ({}x{}) ...", mProbeCount, res, res);
+
+    for (uint32_t i = 0; i < mProbeCount; i++)
+    {
+        float3 probePos = float3(mProbePositions[i].x, mProbePositions[i].y, mProbePositions[i].z);
+
+        // Set per-probe constant.
+        var["CB"]["gProbePosition"] = probePos;
+
+        // Dispatch ray tracing shader.
+        mpRayTracePass->execute(pRenderContext, uint3(res, res, 1));
+
+        // Read back the single-channel texture data (handles GPU flush/sync internally).
+        uint32_t subresource = mpProbeImage->getSubresourceIndex(0, 0);
+        std::vector<uint8_t> data = pRenderContext->readTextureSubresource(mpProbeImage.get(), subresource);
+
+        // Convert R32Float (1 channel) to RGB32Float (3 channels) for Bitmap::saveImage.
+        const float* srcPixels = reinterpret_cast<const float*>(data.data());
+        uint32_t pixelCount = res * res;
+        std::vector<float> rgbData(pixelCount * 3);
+        for (uint32_t p = 0; p < pixelCount; p++)
+        {
+            rgbData[p * 3 + 0] = srcPixels[p];
+            rgbData[p * 3 + 1] = srcPixels[p];
+            rgbData[p * 3 + 2] = srcPixels[p];
+        }
+
+        // Save as EXR with half-float precision.
+        std::string filename = fmt::format("probe_{:06d}.exr", i);
+        std::filesystem::path filePath = savePath / filename;
+
+        Bitmap::saveImage(
+            filePath,
+            res,
+            res,
+            Bitmap::FileFormat::ExrFile,
+            exportFlags,
+            ResourceFormat::RGB32Float,
+            true, // isTopDown
+            rgbData.data()
+        );
+
+        // Write CSV row.
+        csv << fmt::format("{},{},{},{},{}\n", i, probePos.x, probePos.y, probePos.z, filename);
+
+        // Log progress every 10 %.
+        if (mProbeCount >= 10 && (i + 1) % std::max(1u, mProbeCount / 10) == 0)
+        {
+            logInfo(
+                "GenerateProbes: Progress {}/{} ({:.0f}%).",
+                i + 1,
+                mProbeCount,
+                100.0f * (i + 1) / mProbeCount
+            );
+        }
+    }
+
+    csv.close();
+    logInfo("GenerateProbes: Saved {} probe images and CSV to '{}'.", mProbeCount, savePath.string());
+}
+
+// ---------------------------------------------------------------------------
+// execute
+// ---------------------------------------------------------------------------
+
 void GenerateProbes::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     auto pColor = renderData.getTexture(kColor);
     auto pVBuffer = renderData.getTexture(kVBuffer);
     auto pOutput = renderData.getTexture(kOutput);
+
+    // Handle deferred probe image generation (triggered by UI button).
+    if (mGenerateImagesRequested)
+    {
+        mGenerateImagesRequested = false;
+        generateProbeImages(pRenderContext);
+    }
 
     // Passthrough if disabled or scene is not ready.
     if (!mEnabled || !mpScene || !mpDrawProbesPass)
@@ -255,6 +414,10 @@ void GenerateProbes::execute(RenderContext* pRenderContext, const RenderData& re
     mpDrawProbesPass->execute(pRenderContext, uint3(mFrameDim, 1));
 }
 
+// ---------------------------------------------------------------------------
+// UI
+// ---------------------------------------------------------------------------
+
 void GenerateProbes::renderUI(Gui::Widgets& widget)
 {
     widget.checkbox("Enable", mEnabled);
@@ -286,5 +449,21 @@ void GenerateProbes::renderUI(Gui::Widgets& widget)
                 bounds.maxPoint.z
             ));
         }
+    }
+
+    // --- Probe image generation controls ---
+    if (auto group = widget.group("Probe Image Generation", true))
+    {
+        group.var("Image Resolution", mProbeImageResolution, 4u, 1024u, 1u);
+        group.tooltip("Resolution (NxN) of each probe distance image.");
+
+        group.textbox("Save Path", mSavePath);
+        group.tooltip("Directory where probe images and CSV will be saved.");
+
+        if (group.button("Generate Probe Images"))
+        {
+            mGenerateImagesRequested = true;
+        }
+        group.tooltip("Ray-trace a distance image for every probe and save to disk.");
     }
 }
